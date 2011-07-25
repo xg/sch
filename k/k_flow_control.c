@@ -148,6 +148,7 @@ write_prediction(struct file *file,
 
     unsigned long id;
     unsigned long long time;
+    unsigned long long otime;
     unsigned int size;
     int priority;
     int cmd_code;
@@ -165,10 +166,11 @@ write_prediction(struct file *file,
     if (copy_from_user(procfs_buffer, buffer, procfs_buffer_size)) {
         return -EFAULT;
     }
-    n = sscanf(procfs_buffer, "%lu %llu %u %d", &id, &time, &size, &priority);
-    if (n == 4){
+    n = sscanf(procfs_buffer, "%lu %llu %llu %u %d", &id, &otime, &time, &size, &priority);
+    if (n == 5){
         tp = (tfc_t *) kmalloc(sizeof(tfc_t), GFP_KERNEL);
         tp->id = id;
+        tp->otime = otime;
         tp->time = time;
         tp->size = size;
         tp->priority = priority;
@@ -184,8 +186,8 @@ write_prediction(struct file *file,
                     dclist_foreach(ln, &headt.list) {
                         tp = dclist_outer(ln, tfc_t, list);
 #ifdef DEBUG
-                        printk(KERN_INFO "|%lu  %llu  %u  %d\n", 
-                                         tp->id, tp->time, 
+                        printk(KERN_INFO "|%lu  %llu  %llu  %u  %d\n", 
+                                         tp->id, tp->otime, tp->time, 
                                          tp->size, tp->priority);
 #endif
                         count++;
@@ -257,6 +259,8 @@ traffic_sharp(unsigned int hook,
     int (*okfn)(struct sk_buff *skb))
 {
     struct iphdr *iph = ip_hdr(skb);
+    unsigned long first_id = 0;
+    unsigned long long first_pkt_delay = 0;
     tfc_t *tp = NULL;
     struct lnode *ln;
     struct timeval timenow;
@@ -264,6 +268,12 @@ traffic_sharp(unsigned int hook,
     //printk(KERN_INFO "::FC_D::%pI4 > %pI4\n", &iph->saddr, &iph->daddr);
     //printk(KERN_INFO "::FC_D::%08X | %08X | %d\n", 
     //                    ntohl(iph->daddr), target_ip, flow_control);
+
+    /* get the id and delay of the first traffic data */
+    tp = dclist_outer(headt.list.next, tfc_t, list);
+    if (tp != &headt) {
+        first_id = tp->id;
+    }
 
     if (iph->daddr == target_ip && flow_control) {
         printk(KERN_INFO "::FC::%pI4 > %pI4\n", &iph->saddr, &iph->daddr);
@@ -276,7 +286,7 @@ traffic_sharp(unsigned int hook,
 
         if (tp == &headt) {
             //If we run to here, it should be a bug.
-            //NOT queue this packet
+            //DON'T queue this packet
             printk(KERN_ERR "traffic_sharp, cannot match traffic data id\n");
             return NF_DROP;
         }
@@ -293,9 +303,10 @@ traffic_sharp(unsigned int hook,
         /* Queue the matched packet */
         printk(KERN_INFO "::::::QUEUE:[%04X]\n", (unsigned int)fcp->id);
 
-        if (++queued_counter == 1) {
+        if (first_id == iph->check) {
+            //here comes the first packet, we calculate the global time shifting
             do_gettimeofday(&timenow);
-            time_delta = fcp->time - tv2ms(&timenow);
+            time_delta = fcp->otime - tv2ms(&timenow);
         }
         return NF_QUEUE;
     } else {
@@ -325,51 +336,11 @@ static int
 queue_callback(struct nf_queue_entry *entry, 
                 unsigned int queuenum) 
 {
-    //struct iphdr *iph = ip_hdr(entry->skb);
-    //struct nf_queue_entry *q, *qnext;
-    //int reinject_pkts = 0; /* flag */
-    //tfc_t *tfc_curr, *tfc_next;
-    //struct timeval timenow;
-    
     spin_lock(&q_lock);
     entry->id = entry_id++;
     printk(KERN_INFO "::::::ID in queue: %d\n", entry->id);
     list_add_tail(&entry->list, &head_entry.list);
     spin_unlock(&q_lock);  
-/*
-    for (;;) {
-        tfc_curr = dclist_outer(qlp->list.next, tfc_t, list);
-        if (tfc_curr == &headt || tfc_curr->id == iph->check)
-            break;
-    }
-
-    if (tfc_curr == &headt) {
-        //TODO it will be a bug if we run to here...
-        printk(KERN_ERR "queue_callback, qlp_curr reaches head!!\n");
-        return 1;
-    }
-    qlp = tfc_curr;
-
-    do_gettimeofday(&timenow);
-    printk(KERN_INFO "real_sending_time = %llu | %llu\n", tfc_curr->time - time_delta, timenow.tv_sec*1000 + timenow.tv_usec/1000);
-    
-    tfc_next = dclist_outer(tfc_curr->list.next, tfc_t, list);
-    if (tfc_next != &headt 
-            && (tfc_next->time - tfc_curr->time) > MAX_BURST_GAP)
-        reinject_pkts = 1;
-
-    if (tfc_next == &headt)
-        reinject_pkts = 1;
-
-    if (reinject_pkts) {
-        list_for_each_entry_safe(q, qnext, &head_entry.list, list) {
-            printk(KERN_INFO "::::::Reinject: %d\n", q->id);
-            nf_reinject(q, NF_ACCEPT);
-        }
-        INIT_LIST_HEAD(&head_entry.list);
-        reinject_pkts = 0;
-    }
-*/
     return 1;
 }
 
@@ -405,13 +376,10 @@ int dequeue_func(void *data) {
                     break;
             }
             if (tfc_curr == &headt) {
-                printk(KERN_ERR "cannot find a matched traffic info for: %u\n",
+                printk(KERN_INFO "cannot find a matched traffic info for: %u\n",
                         pkid);
                 break;
             }
-            qlp = tfc_curr;
-            
-            //printk(KERN_INFO "::DEQUEUE_TH::pkid %04x\n", pkid);
             
             do_gettimeofday(&tn);
             printk(KERN_INFO "::DEQUEUE_TH::[%4X]c %lu | delta %lld | tfc %llu | tfc_R %llu\n",
@@ -424,6 +392,7 @@ int dequeue_func(void *data) {
                 list_del(&q->list);
                 printk(KERN_INFO "::::::Reinject: %d[%04x]\n", q->id, pkid);
                 nf_reinject(q, NF_ACCEPT);
+                qlp = tfc_curr;
             } else {
                 sleep_time = -time_diff;
                 break;
@@ -436,8 +405,8 @@ int dequeue_func(void *data) {
         //if (sleep_time > 1000) 
         //    sleep_time = 1000;
         //if (sleep_time != 5)
-        printk(KERN_INFO "::DEQUEUE_TH::sleeptime = %u\n", sleep_time);
-        msleep_interruptible(sleep_time);
+        //printk(KERN_INFO "::DEQUEUE_TH::sleeptime = %u\n", sleep_time);
+        msleep_interruptible(1);
         if (kthread_should_stop())
             break;
     }
