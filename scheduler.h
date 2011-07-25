@@ -19,7 +19,7 @@ typedef struct traffic_data {
  * Schedule fuction, accepting a list of trafic data, and re-arranging
  * the sending time for each of them in order to achieve bursting.
  */
-int schedule(tfc_t*, long, long); 
+int sch_schedule(tfc_t*, long, long); 
 
 #define MS_IP "192.168.10.1"
 #endif

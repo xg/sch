@@ -7,6 +7,8 @@
 #include <errno.h>
 #include "scheduler.h"
 
+#define DEBUG 1
+
 #define BW_PER_SEC      "1024000000"    /* byte per second */
 #define MAX_INTERVAL    "100"           /* in millisecond */
 
@@ -14,13 +16,13 @@
 extern tfc_t *build_traffic_pcap(char *, char *);
 extern int result_compare(tfc_t *, char *);
 
-int schedule(tfc_t* head, long bw, long max_interval) 
+int sch_schedule(tfc_t* head, long bw, long max_interval) 
 {
 
     tfc_t *itr, *itr_prev;
     struct lnode *lp;
     int pkt_interval;
-    int pkt_trans_time;
+    int pkt_trans_time; /* in milliseconds */
 
     dclist_rforeach(lp, &head->list) {
         itr = dclist_outer(lp, tfc_t, list);
@@ -30,7 +32,7 @@ int schedule(tfc_t* head, long bw, long max_interval)
         itr_prev = dclist_outer(lp->prev, tfc_t, list);
         
         pkt_interval = itr->time - itr_prev->time;
-        pkt_trans_time = (int)((double)itr_prev->size / bw);
+        pkt_trans_time = (int)((double)itr_prev->size / bw * 1000);
         if (pkt_interval <= itr_prev->priority * max_interval
             && pkt_interval >= pkt_trans_time) {
             itr_prev->time = itr->time - pkt_trans_time;
@@ -128,6 +130,12 @@ int main(int argc, char *argv[])
     
     tfc_t *headt;
 
+#ifdef DEBUG
+    struct lnode *ln;
+    tfc_t *tp;
+    unsigned long long prev_time;
+#endif
+
     /* Read command line options */
     /* ------------------------- */
     if (argc <= 1) {
@@ -188,7 +196,20 @@ int main(int argc, char *argv[])
     }
 
     headt = build_traffic_pcap(arg_source, arg_target_ip);
-    schedule(headt, bandwidth, max_interval);
+    sch_schedule(headt, bandwidth, max_interval);
+
+#ifdef DEBUG
+    tp = dclist_outer(&headt->list, tfc_t, list);
+    if (tp != headt) {
+        prev_time = tp->time;
+    }
+    printf("::::::After Sharping:\n");
+    dclist_foreach(ln, &headt->list) {
+        tp = dclist_outer(ln, tfc_t, list);
+        printf("%08lX | delta = %llu\n", tp->id, tp->time - prev_time);
+        prev_time = tp->time;
+    }
+#endif
 
     if (mode == 'g')
         /*  Transfer sharped pkt information to the kernel module */

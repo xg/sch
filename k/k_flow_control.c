@@ -1,5 +1,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/init.h>
 #include <linux/skbuff.h>
@@ -35,6 +36,8 @@ static tfc_t headt = {
  */
 static int flow_control = 0;
 
+static long long time_delta = 0;
+
 /**
  * Flow control pointer, which points to current traffic data.
  */
@@ -45,11 +48,28 @@ static tfc_t *fcp = &headt;
  */
 static tfc_t *qlp = &headt;
 
+/**
+ * A thread to decrease the buffered packets queue and reinject packets.
+ */
+struct task_struct *dequeue_thread;
+
+/**
+ *head of the list of the nf_queue 
+ */
+static struct nf_queue_entry head_entry = { 
+    .list = LIST_HEAD_INIT(head_entry.list)
+};
+
+#ifndef CONFIG_DEBUG_SPINLOCK
+#define CONFIG_DEBUG_SPINLOCK
+#endif
+DEFINE_SPINLOCK(q_lock);
+
 
 /**
  * Utility function, convert string format of IP to 32 bit unsigned.
  */
-static u32 k_v4pton(char *ipv4)
+static inline u32 k_v4pton(char *ipv4)
 {
     u32 ip;
     unsigned char *p = (unsigned char *) &ip;
@@ -57,6 +77,12 @@ static u32 k_v4pton(char *ipv4)
         return 0;
     return ip;
 }
+
+#define cal_rtime(otime) \
+    ((long long)(otime) - time_delta)
+
+#define tv2ms(tv) \
+    ((tv)->tv_sec * 1000 + (tv)->tv_usec / 1000)
 
 /**
  * Proc command code
@@ -216,7 +242,7 @@ static struct file_operations prediction_ops = {
 /**
  * NF_HOOK
  =============================================================================*/
-
+static unsigned int queued_counter = 0;
 /**
  * NF_HOOK call back function
  * In this function, we queue all packets with destination to the target ip.
@@ -233,6 +259,7 @@ traffic_sharp(unsigned int hook,
     struct iphdr *iph = ip_hdr(skb);
     tfc_t *tp = NULL;
     struct lnode *ln;
+    struct timeval timenow;
 
     //printk(KERN_INFO "::FC_D::%pI4 > %pI4\n", &iph->saddr, &iph->daddr);
     //printk(KERN_INFO "::FC_D::%08X | %08X | %d\n", 
@@ -264,8 +291,12 @@ traffic_sharp(unsigned int hook,
         }
 
         /* Queue the matched packet */
-        printk(KERN_INFO "::::::QUEUE:%lu  %llu  %u  %d\n", 
-                            fcp->id, fcp->time, fcp->size, fcp->priority);
+        printk(KERN_INFO "::::::QUEUE:[%04X]\n", (unsigned int)fcp->id);
+
+        if (++queued_counter == 1) {
+            do_gettimeofday(&timenow);
+            time_delta = fcp->time - tv2ms(&timenow);
+        }
         return NF_QUEUE;
     } else {
         return NF_ACCEPT;
@@ -289,25 +320,23 @@ static struct nf_hook_ops pkt_ops = {
 
 static unsigned int entry_id = 1;
 
-/* head of the list of the nf_queue */
-static struct nf_queue_entry head_entry = { 
-    .list = LIST_HEAD_INIT(head_entry.list)
-};
-
 /* Queue call back function */
 static int
 queue_callback(struct nf_queue_entry *entry, 
                 unsigned int queuenum) 
 {
-    struct iphdr *iph = ip_hdr(entry->skb);
-    struct nf_queue_entry *q, *qnext;
-    int reinject_pkts = 0; /* flag */
-    tfc_t *tfc_curr, *tfc_next;
-
+    //struct iphdr *iph = ip_hdr(entry->skb);
+    //struct nf_queue_entry *q, *qnext;
+    //int reinject_pkts = 0; /* flag */
+    //tfc_t *tfc_curr, *tfc_next;
+    //struct timeval timenow;
+    
+    spin_lock(&q_lock);
     entry->id = entry_id++;
     printk(KERN_INFO "::::::ID in queue: %d\n", entry->id);
     list_add_tail(&entry->list, &head_entry.list);
-    
+    spin_unlock(&q_lock);  
+/*
     for (;;) {
         tfc_curr = dclist_outer(qlp->list.next, tfc_t, list);
         if (tfc_curr == &headt || tfc_curr->id == iph->check)
@@ -320,6 +349,10 @@ queue_callback(struct nf_queue_entry *entry,
         return 1;
     }
     qlp = tfc_curr;
+
+    do_gettimeofday(&timenow);
+    printk(KERN_INFO "real_sending_time = %llu | %llu\n", tfc_curr->time - time_delta, timenow.tv_sec*1000 + timenow.tv_usec/1000);
+    
     tfc_next = dclist_outer(tfc_curr->list.next, tfc_t, list);
     if (tfc_next != &headt 
             && (tfc_next->time - tfc_curr->time) > MAX_BURST_GAP)
@@ -336,6 +369,7 @@ queue_callback(struct nf_queue_entry *entry,
         INIT_LIST_HEAD(&head_entry.list);
         reinject_pkts = 0;
     }
+*/
     return 1;
 }
 
@@ -344,6 +378,72 @@ static struct nf_queue_handler queuehandler = {
     .name = "TrafficSchedulerQueue",
     .outfn = &queue_callback
 };
+
+/**
+ * Dequeue_thread
+ ==========================================================================*/
+int dequeue_func(void *data) {
+    struct nf_queue_entry *q, *qnext;
+    tfc_t *tfc_curr;
+    unsigned int pkid;
+    long long time_diff;
+    struct timeval tn;
+    unsigned int sleep_time;
+
+    for (;;) {
+        sleep_time = 2;
+
+        spin_lock(&q_lock);
+        
+        list_for_each_entry_safe(q, qnext, &head_entry.list, list) {
+            pkid = ip_hdr(q->skb)->check;
+
+            tfc_curr = qlp;
+            for (;;) {
+                tfc_curr = dclist_outer(tfc_curr->list.next, tfc_t, list);
+                if (tfc_curr == &headt || tfc_curr->id == pkid)
+                    break;
+            }
+            if (tfc_curr == &headt) {
+                printk(KERN_ERR "cannot find a matched traffic info for: %u\n",
+                        pkid);
+                break;
+            }
+            qlp = tfc_curr;
+            
+            //printk(KERN_INFO "::DEQUEUE_TH::pkid %04x\n", pkid);
+            
+            do_gettimeofday(&tn);
+            printk(KERN_INFO "::DEQUEUE_TH::[%4X]c %lu | delta %lld | tfc %llu | tfc_R %llu\n",
+                        pkid,
+                        tv2ms(&tn), time_delta, 
+                        tfc_curr->time, cal_rtime(tfc_curr->time));
+            time_diff = tv2ms(&tn) - cal_rtime(tfc_curr->time);
+            printk(KERN_INFO "::DEQUEUE_TH::time_diff=%lld\n", time_diff);
+            if (time_diff >= 0) {
+                list_del(&q->list);
+                printk(KERN_INFO "::::::Reinject: %d[%04x]\n", q->id, pkid);
+                nf_reinject(q, NF_ACCEPT);
+            } else {
+                sleep_time = -time_diff;
+                break;
+            }
+            
+        }
+
+        spin_unlock(&q_lock);
+        
+        //if (sleep_time > 1000) 
+        //    sleep_time = 1000;
+        //if (sleep_time != 5)
+        printk(KERN_INFO "::DEQUEUE_TH::sleeptime = %u\n", sleep_time);
+        msleep_interruptible(sleep_time);
+        if (kthread_should_stop())
+            break;
+    }
+    return 0;
+}
+ 
 
 /**
  * KERNEL MODULE related
@@ -389,7 +489,9 @@ static int __init pkts_init(void) {
     prediction_file->uid = 0;
     prediction_file->gid = 0;
     prediction_file->size = 80;
-
+    
+    /* Start dequeue thread */
+    dequeue_thread = kthread_run(dequeue_func, NULL, "sch_dqueue");
     return 0;
 }
 
@@ -399,9 +501,14 @@ static int __init pkts_init(void) {
 static void __exit pkts_exit(void) {
     tfc_t *tp;
     struct lnode *ln, *ltemp;
+    /* Stop thread */
+    kthread_stop(dequeue_thread);
+    
+    /* Remove callback */
     nf_unregister_queue_handlers(&queuehandler);
     nf_unregister_hook(&pkt_ops);
     
+    /* Remove proc */
     remove_proc_entry(PROC_F_PREDICTION, proc_dir);
     remove_proc_entry(PROC_DIR, NULL);
 
